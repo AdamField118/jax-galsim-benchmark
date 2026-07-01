@@ -14,7 +14,7 @@ identical random draws for both -- and then compares the two:
   agreement between the two renderings of each object.
 - **Performance**: wall time per object for each backend.
 
-### jax-galsim rendering strategy (important)
+### jax-galsim rendering strategy
 
 jax-galsim can be rendered two ways, selected by `comparison.jax_mode`:
 
@@ -28,9 +28,7 @@ jax-galsim can be rendered two ways, selected by `comparison.jax_mode`:
 - **`both`** -- run eager and batched head-to-head.
 
 If you ran the benchmark and jax-galsim took *minutes* for 10,000 objects, you
-were on the eager path. **See [`ANALYSIS.md`](ANALYSIS.md)** for the full
-explanation (are we compiling once? are we saturating the L40S? how could
-jax-galsim be slower?) and `src/diagnose_jax.py` to reproduce the diagnosis on
+were on the eager path. See  `src/diagnose_jax.py` to reproduce the diagnosis on
 your hardware:
 
 ```bash
@@ -91,5 +89,3 @@ default.
 - `src/main.py` -- CLI entry point tying the above together.
 - `src/diagnose_jax.py` -- standalone script that measures op counts, compile
   counts, and eager-vs-batched timing to explain the performance gap.
-- [`ANALYSIS.md`](ANALYSIS.md) -- why jax-galsim was slow and how the batched
-  path fixes it.
