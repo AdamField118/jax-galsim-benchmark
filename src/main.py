@@ -34,6 +34,17 @@ def parse_args():
         "before the timed comparison)",
     )
     parser.add_argument(
+        "--jax-mode", choices=["eager", "batched", "both"], default=None,
+        help="Override comparison.jax_mode: 'eager' (one object at a time, no GPU "
+        "saturation), 'batched' (jit+vmap over batches, saturates a GPU), or 'both'",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None, help="Override comparison.jax_batch_size"
+    )
+    parser.add_argument(
+        "--fft-size", type=int, default=None, help="Override comparison.jax_fft_size"
+    )
+    parser.add_argument(
         "--outdir", default=None, help="Override output.dir from the config"
     )
     parser.add_argument(
@@ -69,11 +80,15 @@ def main():
     outdir = args.outdir or full_cfg.get("output", {}).get("dir", "results")
     os.makedirs(outdir, exist_ok=True)
 
-    n_warmup = full_cfg.get("comparison", {}).get("jax_warmup_galaxies", 50)
-    if args.jax_warmup is not None:
-        n_warmup = args.jax_warmup
+    comp_cfg = full_cfg.get("comparison", {})
+    n_warmup = args.jax_warmup if args.jax_warmup is not None else comp_cfg.get("jax_warmup_galaxies", 50)
+    jax_mode = args.jax_mode or comp_cfg.get("jax_mode", "batched")
+    batch_size = args.batch_size or comp_cfg.get("jax_batch_size", 512)
+    fft_size = args.fft_size or comp_cfg.get("jax_fft_size", 256)
 
-    from dataset import pregenerate_truth, generate_dataset, warmup_jit
+    from dataset import (
+        pregenerate_truth, generate_dataset, generate_dataset_batched, warmup_jit,
+    )
 
     print(f"Pre-generating truth values for {cfg['n_obs']} objects (seed={cfg['seed']})...")
     truth, psf_mode, used_real_catalog = pregenerate_truth(cfg, paths)
@@ -91,18 +106,45 @@ def main():
     jax.config.update("jax_enable_x64", True)
     import jax_galsim
 
-    jax_jit_warmup_s = None
-    if n_warmup > 0:
-        print(
-            f"\nWarming up jax-galsim's JIT with {n_warmup} throwaway galaxies "
-            f"(untimed, not part of the comparison)..."
-        )
-        jax_jit_warmup_s = warmup_jit(jax_galsim, cfg, paths, psf_mode, n_warmup)
-        print(f"  warmup wall time: {jax_jit_warmup_s:.3f}s")
+    print(f"\njax-galsim {jax_galsim.__version__} on devices: {jax.devices()}")
 
-    print(f"\nRendering {cfg['n_obs']} objects with jax-galsim {jax_galsim.__version__} (post-warmup)...")
-    ds_jax = generate_dataset(jax_galsim, truth, cfg, psf_mode)
-    print(f"  total={ds_jax.total_time:.3f}s  {ds_jax.mean_ms:.3f}+/-{ds_jax.std_ms:.3f} ms/obj")
+    jax_jit_warmup_s = None
+    ds_jax = None
+
+    if jax_mode in ("batched", "both"):
+        print(
+            f"\n[batched] Rendering {cfg['n_obs']} objects with jit(vmap(...)), "
+            f"batch_size={batch_size}, fft_size={fft_size} (GPU-saturating path)..."
+        )
+        ds_jax_batched = generate_dataset_batched(
+            jax_galsim, truth, cfg, psf_mode, batch_size=batch_size, fft_size=fft_size
+        )
+        print(
+            f"  total={ds_jax_batched.total_time:.3f}s  "
+            f"{ds_jax_batched.mean_ms:.4f} ms/obj (steady-state)  "
+            f"first-chunk compile+run={ds_jax_batched.compile_time:.3f}s"
+        )
+        ds_jax = ds_jax_batched
+
+    if jax_mode in ("eager", "both"):
+        if n_warmup > 0:
+            print(
+                f"\n[eager] Warming up jax-galsim's JIT with {n_warmup} throwaway "
+                f"galaxies (untimed)..."
+            )
+            jax_jit_warmup_s = warmup_jit(jax_galsim, cfg, paths, psf_mode, n_warmup)
+            print(f"  warmup wall time: {jax_jit_warmup_s:.3f}s")
+
+        print(f"\n[eager] Rendering {cfg['n_obs']} objects one-at-a-time (post-warmup)...")
+        ds_jax_eager = generate_dataset(jax_galsim, truth, cfg, psf_mode)
+        print(f"  total={ds_jax_eager.total_time:.3f}s  {ds_jax_eager.mean_ms:.3f}+/-{ds_jax_eager.std_ms:.3f} ms/obj")
+        if jax_mode == "both":
+            print(
+                f"\n  batched is {ds_jax_eager.mean_ms / ds_jax_batched.mean_ms:.1f}x "
+                f"faster per object than eager"
+            )
+        else:
+            ds_jax = ds_jax_eager
 
     if args.save_datasets:
         helpers.save_dataset_npz(os.path.join(outdir, "dataset_galsim.npz"), ds_galsim)

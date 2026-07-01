@@ -295,3 +295,120 @@ def generate_dataset(mod, truth_list, cfg, psf_mode, dtype=np.float64):
         mean_ms=float(per_object_time.mean() * 1e3),
         std_ms=float(per_object_time.std() * 1e3),
     )
+
+
+# ---------------------------------------------------------------------------
+# Batched jax-galsim rendering (the GPU-saturating path)
+#
+# The one-at-a-time `make_one` loop above is a faithful drop-in port of the
+# galsim code, but it is pathologically slow for jax-galsim on a GPU: each
+# drawImage expands to ~580 primitive XLA ops, and rendering objects one at a
+# time in a Python loop dispatches those ~1,500 kernels (3 draws/object)
+# serially per object, gated by kernel-launch + host<->device-copy latency,
+# with a single 53x53 stamp using a rounding-error fraction of the device.
+#
+# To actually use the GPU we follow the pattern from JAX-GalSim's "sharp bits"
+# docs: pin the FFT size (minimum_fft_size == maximum_fft_size) so every
+# object has identical array shapes, then `jax.vmap` the render over a batch
+# and `jax.jit` it so the whole batch compiles ONCE and runs as fused kernels
+# over a batch axis wide enough to fill the SMs. See ANALYSIS.md.
+# ---------------------------------------------------------------------------
+
+def _stack_truth(truth_list, cfg, psf_mode):
+    """Stack the per-object truth dicts into contiguous arrays for vmap."""
+    n = len(truth_list)
+    hlr = np.array([t["hlr"] for t in truth_list])
+    flux = np.array([t["flux"] for t in truth_list])
+    g1 = np.array([t["g1"] for t in truth_list])
+    g2 = np.array([t["g2"] for t in truth_list])
+    dx = np.array([t["dx"] for t in truth_list])
+    dy = np.array([t["dy"] for t in truth_list])
+    if psf_mode == "superbit":
+        psf_stamps = np.stack([t["psf_stamp"] for t in truth_list])
+    else:
+        psf_stamps = np.zeros((n, cfg["psf_npix"], cfg["psf_npix"]))
+    return dict(hlr=hlr, flux=flux, g1=g1, g2=g2, dx=dx, dy=dy, psf_stamps=psf_stamps)
+
+
+def _make_batched_render_fn(mod, cfg, psf_mode, fft_size):
+    """Build a jit(vmap(render_one)) callable with a pinned, static FFT size."""
+    scale = cfg["scale"]
+    npix = cfg["npix"]
+    npix_psf = cfg["psf_npix"]
+    shear_true = cfg["shear_true"]
+    psf_fwhm = cfg["psf_fwhm"]
+    # Pinning min == max makes the k-space FFT grid a compile-time constant, so
+    # the batch compiles once instead of retracing on every object's size.
+    gsp = mod.GSParams(minimum_fft_size=fft_size, maximum_fft_size=fft_size)
+
+    def render_one(psf_stamp, hlr, flux, g1, g2, dx, dy):
+        if psf_mode == "superbit":
+            psf = mod.InterpolatedImage(mod.Image(psf_stamp, scale=scale), gsparams=gsp)
+        else:
+            psf = mod.Gaussian(fwhm=psf_fwhm, gsparams=gsp)
+        obj0 = mod.Exponential(half_light_radius=hlr, flux=flux).shear(g1=g1, g2=g2)
+        objp = obj0.shear(g1=shear_true, g2=0.0).shift(dx=dx, dy=dy)
+        objm = obj0.shear(g1=-shear_true, g2=0.0).shift(dx=dx, dy=dy)
+        psf_im = psf.drawImage(nx=npix_psf, ny=npix_psf, scale=scale).array
+        im_p = mod.Convolve(psf, objp, gsparams=gsp).drawImage(nx=npix, ny=npix, scale=scale).array
+        im_m = mod.Convolve(psf, objm, gsparams=gsp).drawImage(nx=npix, ny=npix, scale=scale).array
+        return psf_im, im_p, im_m
+
+    import jax
+    return jax.jit(jax.vmap(render_one))
+
+
+def generate_dataset_batched(mod, truth_list, cfg, psf_mode, batch_size, fft_size, dtype=np.float64):
+    """Render the dataset with jax-galsim using jit+vmap over batches.
+
+    Splits the objects into chunks of `batch_size` (to bound the FFT
+    intermediate memory: each chunk holds ~batch_size * fft_size^2 complex
+    values on the device), rendering each chunk in one fused, pre-compiled
+    kernel. Timing is reported per chunk; the first chunk's time includes the
+    one-time XLA compilation and is tracked separately.
+    """
+    import jax.numpy as jnp
+
+    n = len(truth_list)
+    stacked = _stack_truth(truth_list, cfg, psf_mode)
+    render = _make_batched_render_fn(mod, cfg, psf_mode, fft_size)
+
+    psf_ims = np.empty((n, cfg["psf_npix"], cfg["psf_npix"]))
+    im_ps = np.empty((n, cfg["npix"], cfg["npix"]))
+    im_ms = np.empty((n, cfg["npix"], cfg["npix"]))
+    per_chunk_time = []
+
+    t_start = time.perf_counter()
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        args = [jnp.asarray(stacked[k][start:stop]) for k in ("psf_stamps", "hlr", "flux", "g1", "g2", "dx", "dy")]
+        t0 = time.perf_counter()
+        psf_b, p_b, m_b = render(*args)
+        # block so the timer captures actual device execution, not just dispatch
+        p_b.block_until_ready()
+        per_chunk_time.append(time.perf_counter() - t0)
+        psf_ims[start:stop] = np.asarray(psf_b)
+        im_ps[start:stop] = np.asarray(p_b)
+        im_ms[start:stop] = np.asarray(m_b)
+    total_time = time.perf_counter() - t_start
+
+    # add the same precomputed noise the eager path uses
+    psf_ims += np.stack([t["noise_psf"] for t in truth_list])
+    im_ps += np.stack([t["noise_p"] for t in truth_list])
+    im_ms += np.stack([t["noise_m"] for t in truth_list])
+
+    per_chunk_time = np.array(per_chunk_time)
+    compile_time = float(per_chunk_time[0]) if len(per_chunk_time) else 0.0
+    steady = per_chunk_time[1:] if len(per_chunk_time) > 1 else per_chunk_time
+    steady_objs = max(n - batch_size, batch_size)
+
+    return SimpleNamespace(
+        psf_images=psf_ims,
+        images_p=im_ps,
+        images_m=im_ms,
+        per_object_time=np.repeat(per_chunk_time / batch_size, 1),  # per-chunk, coarse
+        total_time=total_time,
+        compile_time=compile_time,
+        mean_ms=float(steady.sum() / steady_objs * 1e3),
+        std_ms=float((steady / batch_size).std() * 1e3) if len(steady) else 0.0,
+    )

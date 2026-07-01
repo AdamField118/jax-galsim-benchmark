@@ -64,11 +64,13 @@ def _plot_timing(ds_galsim, ds_jax, outdir, label_a, label_b):
     axes[0].set_ylabel("ms / object (post-warmup)")
     axes[0].set_title("Per-object render time")
 
-    n = len(ds_galsim.per_object_time)
-    axes[1].plot(np.arange(n), ds_galsim.per_object_time * 1e3, label=label_a)
-    axes[1].plot(np.arange(n), ds_jax.per_object_time * 1e3, label=label_b)
+    # Each series carries its own sampling: galsim/eager time per object, the
+    # batched path times per chunk, so plot each against its own index.
+    for ds, label in ((ds_galsim, label_a), (ds_jax, label_b)):
+        t = ds.per_object_time
+        axes[1].plot(np.arange(len(t)), t * 1e3, label=label)
     axes[1].set_yscale("log")
-    axes[1].set_xlabel("object index")
+    axes[1].set_xlabel("sample index (per object, or per batch for batched jax)")
     axes[1].set_ylabel("ms")
     axes[1].set_title("Per-object time (log scale, post-warmup)")
     axes[1].legend()

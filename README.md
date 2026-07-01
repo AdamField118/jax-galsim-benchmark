@@ -12,13 +12,32 @@ identical random draws for both -- and then compares the two:
 
 - **Pixel-level agreement**: max/mean absolute pixel difference and flux
   agreement between the two renderings of each object.
-- **Performance**: wall time per object for each backend. Before the timed
-  jax-galsim run, a separate, untimed warmup pass renders
-  `comparison.jax_warmup_galaxies` (default 50) throwaway galaxies through
-  the exact same code path to trigger JIT compilation, so the timed
-  comparison itself is apples-to-apples (galsim needs no such warmup). The
-  default `simulation.n_obs` is 10,000, large enough to amortize any
-  remaining per-call overhead and saturate a GPU-backed jaxlib.
+- **Performance**: wall time per object for each backend.
+
+### jax-galsim rendering strategy (important)
+
+jax-galsim can be rendered two ways, selected by `comparison.jax_mode`:
+
+- **`batched`** (default) -- `jax.jit(jax.vmap(...))` over batches of
+  `jax_batch_size` objects with a pinned FFT size. This is the **only** way to
+  actually use a GPU: it compiles once and renders a whole batch in parallel.
+- **`eager`** -- the naive one-object-at-a-time drop-in. Correct, and a
+  faithful mirror of the galsim loop, but it does *not* saturate a GPU:
+  each object dispatches ~1,500 serial kernel launches. An untimed warmup pass
+  (`comparison.jax_warmup_galaxies`, default 50) precedes the timed eager run.
+- **`both`** -- run eager and batched head-to-head.
+
+If you ran the benchmark and jax-galsim took *minutes* for 10,000 objects, you
+were on the eager path. **See [`ANALYSIS.md`](ANALYSIS.md)** for the full
+explanation (are we compiling once? are we saturating the L40S? how could
+jax-galsim be slower?) and `src/diagnose_jax.py` to reproduce the diagnosis on
+your hardware:
+
+```bash
+cd src
+python diagnose_jax.py            # op counts, compile counts, eager vs batched
+python main.py --jax-mode both    # head-to-head in the real benchmark
+```
 
 ## Real data (COSMOS catalog + empirical PSFs)
 
@@ -46,9 +65,10 @@ in `src/config.yaml`.
 conda env create -f environment.yml
 conda activate jax-galsim-benchmark
 cd src
-./run.sh                       # uses config.yaml as-is (10,000 objects)
+./run.sh                       # uses config.yaml as-is (10,000 objects, batched jax)
 ./run.sh --n-obs 500            # override the number of objects
-./run.sh --jax-warmup 100       # override the untimed JIT-warmup galaxy count
+./run.sh --jax-mode both        # eager vs batched jax-galsim, head-to-head
+./run.sh --batch-size 1024      # objects per jit(vmap) call (GPU occupancy knob)
 ./run.sh --save-datasets        # also dump rendered images to results/*.npz
 ```
 
@@ -62,9 +82,14 @@ default.
 ## Layout
 
 - `src/dataset.py` -- shared image-simulation code, parameterized by backend
-  module (`galsim` or `jax_galsim`).
+  module (`galsim` or `jax_galsim`); includes both the eager one-at-a-time
+  renderer and the batched `jit(vmap)` renderer.
 - `src/compare.py` -- pixel-diff and timing comparison between two rendered
   datasets.
 - `src/plotting.py` -- diagnostic plots (example image triplet, pixel-diff
   histogram, timing).
 - `src/main.py` -- CLI entry point tying the above together.
+- `src/diagnose_jax.py` -- standalone script that measures op counts, compile
+  counts, and eager-vs-batched timing to explain the performance gap.
+- [`ANALYSIS.md`](ANALYSIS.md) -- why jax-galsim was slow and how the batched
+  path fixes it.

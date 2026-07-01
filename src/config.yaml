@@ -35,4 +35,14 @@ comparison:
   jax_warmup_galaxies: 50     # untimed jax-galsim galaxies rendered up front to
                                # trigger JIT compilation, so the timed comparison
                                # below is apples-to-apples with galsim (which
-                               # needs no warmup)
+                               # needs no warmup). Only used for the eager path.
+
+  # jax-galsim rendering strategy. "eager" is the naive one-object-at-a-time
+  # drop-in (correct but does NOT use a GPU -- ~1,500 serial kernel launches
+  # per object). "batched" uses jit(vmap(...)) over batches with a pinned FFT
+  # size, which is what actually saturates a GPU. See ANALYSIS.md.
+  jax_mode: batched           # batched | eager | both
+  jax_batch_size: 512         # objects per jit(vmap) call (bounds device memory:
+                               # ~batch_size * fft_size^2 complex values per chunk)
+  jax_fft_size: 256           # pinned min==max FFT size (must cover the stamp;
+                               # larger = more accurate but more memory/compute)
