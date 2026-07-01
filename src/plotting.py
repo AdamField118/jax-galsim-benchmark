@@ -58,10 +58,10 @@ def _plot_timing(ds_galsim, ds_jax, outdir, label_a, label_b):
 
     axes[0].bar(
         [label_a, label_b],
-        [ds_galsim.steady_state_mean * 1e3, ds_jax.steady_state_mean * 1e3],
-        yerr=[ds_galsim.steady_state_std * 1e3, ds_jax.steady_state_std * 1e3],
+        [ds_galsim.mean_ms, ds_jax.mean_ms],
+        yerr=[ds_galsim.std_ms, ds_jax.std_ms],
     )
-    axes[0].set_ylabel("ms / object (steady-state)")
+    axes[0].set_ylabel("ms / object (post-warmup)")
     axes[0].set_title("Per-object render time")
 
     n = len(ds_galsim.per_object_time)
@@ -70,7 +70,7 @@ def _plot_timing(ds_galsim, ds_jax, outdir, label_a, label_b):
     axes[1].set_yscale("log")
     axes[1].set_xlabel("object index")
     axes[1].set_ylabel("ms")
-    axes[1].set_title("Per-object time (log scale, shows JIT warmup)")
+    axes[1].set_title("Per-object time (log scale, post-warmup)")
     axes[1].legend()
 
     fig.tight_layout()

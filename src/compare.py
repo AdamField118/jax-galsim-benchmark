@@ -14,13 +14,12 @@ def _diff_stats(a, b):
 def _timing_stats(ds):
     return dict(
         total_s=ds.total_time,
-        warmup_s=ds.warmup_time,
-        steady_state_mean_ms=ds.steady_state_mean * 1e3,
-        steady_state_std_ms=ds.steady_state_std * 1e3,
+        mean_ms=ds.mean_ms,
+        std_ms=ds.std_ms,
     )
 
 
-def compare_datasets(ds_galsim, ds_jax, label_a="galsim", label_b="jax_galsim"):
+def compare_datasets(ds_galsim, ds_jax, jax_jit_warmup_s=None, label_a="galsim", label_b="jax_galsim"):
     flux_p_a = ds_galsim.images_p.sum(axis=(1, 2))
     flux_p_b = ds_jax.images_p.sum(axis=(1, 2))
     flux_rel_diff = np.abs(flux_p_a - flux_p_b) / np.abs(flux_p_a)
@@ -33,7 +32,8 @@ def compare_datasets(ds_galsim, ds_jax, label_a="galsim", label_b="jax_galsim"):
         flux_relative_diff_mean=float(flux_rel_diff.mean()),
         flux_relative_diff_max=float(flux_rel_diff.max()),
         timing={label_a: _timing_stats(ds_galsim), label_b: _timing_stats(ds_jax)},
-        speedup_galsim_over_jax=ds_jax.steady_state_mean / ds_galsim.steady_state_mean,
+        jax_jit_warmup_s=jax_jit_warmup_s,
+        speedup_galsim_over_jax=ds_jax.mean_ms / ds_galsim.mean_ms,
     )
 
 
@@ -49,13 +49,14 @@ def print_report(report, label_a="galsim", label_b="jax_galsim"):
     print("\nFlux agreement (relative difference, +shear image):")
     print(f"  mean={report['flux_relative_diff_mean']:.3e}  max={report['flux_relative_diff_max']:.3e}")
 
-    print("\nPerformance:")
+    if report.get("jax_jit_warmup_s") is not None:
+        print(f"\n{label_b} JIT warmup (untimed, excluded from the comparison below): {report['jax_jit_warmup_s']:.3f}s")
+
+    print("\nPerformance (post-warmup):")
     for label in (label_a, label_b):
         t = report["timing"][label]
         print(
             f"  {label:<12s} total={t['total_s']:.3f}s  "
-            f"steady-state={t['steady_state_mean_ms']:.3f}"
-            f"+/-{t['steady_state_std_ms']:.3f} ms/obj  "
-            f"warmup={t['warmup_s']:.3f}s"
+            f"{t['mean_ms']:.3f}+/-{t['std_ms']:.3f} ms/obj"
         )
-    print(f"\n  {label_b} is {report['speedup_galsim_over_jax']:.1f}x slower than {label_a} per object (steady-state)")
+    print(f"\n  {label_b} is {report['speedup_galsim_over_jax']:.1f}x slower than {label_a} per object")

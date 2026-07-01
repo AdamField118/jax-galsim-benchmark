@@ -28,6 +28,12 @@ def parse_args():
         "--n-obs", type=int, default=None, help="Override simulation.n_obs from the config"
     )
     parser.add_argument(
+        "--jax-warmup", type=int, default=None,
+        help="Override comparison.jax_warmup_galaxies from the config "
+        "(number of untimed galaxies rendered with jax-galsim to trigger JIT compilation "
+        "before the timed comparison)",
+    )
+    parser.add_argument(
         "--outdir", default=None, help="Override output.dir from the config"
     )
     parser.add_argument(
@@ -63,9 +69,11 @@ def main():
     outdir = args.outdir or full_cfg.get("output", {}).get("dir", "results")
     os.makedirs(outdir, exist_ok=True)
 
-    warmup = full_cfg.get("comparison", {}).get("jax_warmup", 3)
+    n_warmup = full_cfg.get("comparison", {}).get("jax_warmup_galaxies", 50)
+    if args.jax_warmup is not None:
+        n_warmup = args.jax_warmup
 
-    from dataset import pregenerate_truth, generate_dataset
+    from dataset import pregenerate_truth, generate_dataset, warmup_jit
 
     print(f"Pre-generating truth values for {cfg['n_obs']} objects (seed={cfg['seed']})...")
     truth, psf_mode, used_real_catalog = pregenerate_truth(cfg, paths)
@@ -75,26 +83,26 @@ def main():
     import galsim
 
     print(f"\nRendering {cfg['n_obs']} objects with galsim {galsim.__version__}...")
-    ds_galsim = generate_dataset(galsim, truth, cfg, psf_mode, warmup=0)
-    print(
-        f"  total={ds_galsim.total_time:.3f}s  "
-        f"steady-state={ds_galsim.steady_state_mean * 1e3:.3f}"
-        f"+/-{ds_galsim.steady_state_std * 1e3:.3f} ms/obj"
-    )
+    ds_galsim = generate_dataset(galsim, truth, cfg, psf_mode)
+    print(f"  total={ds_galsim.total_time:.3f}s  {ds_galsim.mean_ms:.3f}+/-{ds_galsim.std_ms:.3f} ms/obj")
 
     import jax
 
     jax.config.update("jax_enable_x64", True)
     import jax_galsim
 
-    print(f"\nRendering {cfg['n_obs']} objects with jax-galsim {jax_galsim.__version__}...")
-    ds_jax = generate_dataset(jax_galsim, truth, cfg, psf_mode, warmup=warmup)
-    print(
-        f"  total={ds_jax.total_time:.3f}s  "
-        f"steady-state={ds_jax.steady_state_mean * 1e3:.3f}"
-        f"+/-{ds_jax.steady_state_std * 1e3:.3f} ms/obj "
-        f"(excludes first {min(warmup, cfg['n_obs'])} call(s), JIT compilation)"
-    )
+    jax_jit_warmup_s = None
+    if n_warmup > 0:
+        print(
+            f"\nWarming up jax-galsim's JIT with {n_warmup} throwaway galaxies "
+            f"(untimed, not part of the comparison)..."
+        )
+        jax_jit_warmup_s = warmup_jit(jax_galsim, cfg, paths, psf_mode, n_warmup)
+        print(f"  warmup wall time: {jax_jit_warmup_s:.3f}s")
+
+    print(f"\nRendering {cfg['n_obs']} objects with jax-galsim {jax_galsim.__version__} (post-warmup)...")
+    ds_jax = generate_dataset(jax_galsim, truth, cfg, psf_mode)
+    print(f"  total={ds_jax.total_time:.3f}s  {ds_jax.mean_ms:.3f}+/-{ds_jax.std_ms:.3f} ms/obj")
 
     if args.save_datasets:
         helpers.save_dataset_npz(os.path.join(outdir, "dataset_galsim.npz"), ds_galsim)
@@ -103,7 +111,7 @@ def main():
 
     from compare import compare_datasets, print_report
 
-    report = compare_datasets(ds_galsim, ds_jax)
+    report = compare_datasets(ds_galsim, ds_jax, jax_jit_warmup_s=jax_jit_warmup_s)
     report_path = os.path.join(outdir, "comparison_report.json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)

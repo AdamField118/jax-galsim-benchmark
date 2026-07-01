@@ -7,7 +7,7 @@ simulation:
   npix: 53
   noise_sd: 12.719674         # per-pixel noise sigma
   seed: 150
-  n_obs: 200                  # number of galaxies to simulate
+  n_obs: 10000                 # number of galaxies to simulate (in the timed comparison)
   shear_true: 0.01            # applied +/- shear used for the sheared pair
   ellipticity_sigma: 0.26     # std dev of the synthetic G1/G2 fallback,
                                # only used if paths.cosmos_cat_fname is missing
@@ -32,5 +32,7 @@ output:
   dir: "results"
 
 comparison:
-  jax_warmup: 3               # number of leading jax-galsim calls excluded
-                               # from the steady-state timing (JIT compilation)
+  jax_warmup_galaxies: 50     # untimed jax-galsim galaxies rendered up front to
+                               # trigger JIT compilation, so the timed comparison
+                               # below is apples-to-apples with galsim (which
+                               # needs no warmup)

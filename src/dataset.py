@@ -110,7 +110,7 @@ def render_empirical_psf_stamp(rng, psf_files, wcs, npix_psf, scale):
     return np.ascontiguousarray(stamp)
 
 
-def load_cosmos_catalog(cat_path, seed, ellipticity_sigma, hlr, flux, n_synthetic=5000):
+def load_cosmos_catalog(cat_path, seed, ellipticity_sigma, hlr, flux, n_synthetic=5000, quiet=False):
     """Load G1/G2/HLR/FLUX from a COSMOS catalog FITS file, or synthesize one.
 
     Mirrors the fallback in shearnet.core.dataset._load_cosmos_cat: if the
@@ -129,10 +129,11 @@ def load_cosmos_catalog(cat_path, seed, ellipticity_sigma, hlr, flux, n_syntheti
             FLUX=np.asarray(data["FLUX"], dtype=np.float64),
         ), True
 
-    print(
-        f"WARNING: cosmos catalog not found at {cat_path!r}; using a synthetic "
-        f"G1/G2 catalog (same fallback shearnet/core/dataset.py uses)."
-    )
+    if not quiet:
+        print(
+            f"WARNING: cosmos catalog not found at {cat_path!r}; using a synthetic "
+            f"G1/G2 catalog (same fallback shearnet/core/dataset.py uses)."
+        )
     rng = np.random.RandomState(seed)
     return dict(
         G1=rng.normal(0.0, ellipticity_sigma, n_synthetic),
@@ -142,7 +143,7 @@ def load_cosmos_catalog(cat_path, seed, ellipticity_sigma, hlr, flux, n_syntheti
     ), False
 
 
-def pregenerate_truth(cfg, paths):
+def pregenerate_truth(cfg, paths, quiet=False):
     """Draw all per-object randomness up front so both backends see the same inputs."""
     rng = np.random.RandomState(cfg["seed"])
     n = cfg["n_obs"]
@@ -158,16 +159,18 @@ def pregenerate_truth(cfg, paths):
         ellipticity_sigma=cfg["ellipticity_sigma"],
         hlr=cfg["hlr"],
         flux=cfg["flux"],
+        quiet=quiet,
     )
     n_cat = len(catalog["G1"])
 
     psf_mode = cfg["psf_mode"]
     psf_files = find_psf_files(paths.get("psf_data_dir")) if psf_mode == "superbit" else []
     if psf_mode == "superbit" and not psf_files:
-        print(
-            f"WARNING: no PSFEx files found under {paths.get('psf_data_dir')!r}; "
-            f"falling back to an analytic Gaussian PSF (psf.fwhm)."
-        )
+        if not quiet:
+            print(
+                f"WARNING: no PSFEx files found under {paths.get('psf_data_dir')!r}; "
+                f"falling back to an analytic Gaussian PSF (psf.fwhm)."
+            )
         psf_mode = "ideal"
     wcs = _create_wcs_from_params(WCS_PARAMS) if psf_mode == "superbit" else None
 
@@ -240,8 +243,33 @@ def make_one(mod, t, cfg, psf_mode, dtype=np.float64):
     return psf_im, im_p, im_m
 
 
-def generate_dataset(mod, truth_list, cfg, psf_mode, dtype=np.float64, warmup=3):
-    """Render the full dataset with one backend, timing each object individually."""
+def warmup_jit(mod, cfg, paths, psf_mode, n_warmup, dtype=np.float64, seed_offset=999983):
+    """Render n_warmup throwaway objects to trigger JIT compilation, untimed images discarded.
+
+    Uses a distinct seed so the warmup objects are disjoint from the ones
+    used in the timed comparison, but the same psf_mode/config so it
+    exercises the exact code path (shapes, PSF representation) that the
+    timed run will hit -- this is what makes the *timed* run apples-to-apples
+    between galsim (which needs no warmup) and jax-galsim (which does).
+    Returns the wall-clock time spent warming up.
+    """
+    warmup_cfg = dict(cfg)
+    warmup_cfg["n_obs"] = n_warmup
+    warmup_cfg["seed"] = cfg["seed"] + seed_offset
+    warmup_truth, _, _ = pregenerate_truth(warmup_cfg, paths, quiet=True)
+
+    t_start = time.perf_counter()
+    for t in warmup_truth:
+        make_one(mod, t, warmup_cfg, psf_mode, dtype=dtype)
+    return time.perf_counter() - t_start
+
+
+def generate_dataset(mod, truth_list, cfg, psf_mode, dtype=np.float64):
+    """Render the full dataset with one backend, timing each object individually.
+
+    Callers that need jax-galsim's JIT warmed up first should call
+    `warmup_jit` before this, so every object timed here is post-warmup.
+    """
     n = len(truth_list)
     psf_ims = np.empty((n, cfg["psf_npix"], cfg["psf_npix"]))
     im_ps = np.empty((n, cfg["npix"], cfg["npix"]))
@@ -258,16 +286,12 @@ def generate_dataset(mod, truth_list, cfg, psf_mode, dtype=np.float64, warmup=3)
         im_ms[i] = im_m
     total_time = time.perf_counter() - t_start
 
-    n_warmup = min(warmup, n)
-    steady = per_object_time[n_warmup:] if n > n_warmup else per_object_time
-
     return SimpleNamespace(
         psf_images=psf_ims,
         images_p=im_ps,
         images_m=im_ms,
         per_object_time=per_object_time,
         total_time=total_time,
-        warmup_time=float(per_object_time[:n_warmup].sum()),
-        steady_state_mean=float(steady.mean()),
-        steady_state_std=float(steady.std()),
+        mean_ms=float(per_object_time.mean() * 1e3),
+        std_ms=float(per_object_time.std() * 1e3),
     )

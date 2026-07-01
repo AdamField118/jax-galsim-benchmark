@@ -12,8 +12,13 @@ identical random draws for both -- and then compares the two:
 
 - **Pixel-level agreement**: max/mean absolute pixel difference and flux
   agreement between the two renderings of each object.
-- **Performance**: wall time per object for each backend, with jax-galsim's
-  JIT-compilation warmup reported separately from its steady-state time.
+- **Performance**: wall time per object for each backend. Before the timed
+  jax-galsim run, a separate, untimed warmup pass renders
+  `comparison.jax_warmup_galaxies` (default 50) throwaway galaxies through
+  the exact same code path to trigger JIT compilation, so the timed
+  comparison itself is apples-to-apples (galsim needs no such warmup). The
+  default `simulation.n_obs` is 10,000, large enough to amortize any
+  remaining per-call overhead and saturate a GPU-backed jaxlib.
 
 ## Real data (COSMOS catalog + empirical PSFs)
 
@@ -41,8 +46,9 @@ in `src/config.yaml`.
 conda env create -f environment.yml
 conda activate jax-galsim-benchmark
 cd src
-./run.sh                       # uses config.yaml as-is
+./run.sh                       # uses config.yaml as-is (10,000 objects)
 ./run.sh --n-obs 500            # override the number of objects
+./run.sh --jax-warmup 100       # override the untimed JIT-warmup galaxy count
 ./run.sh --save-datasets        # also dump rendered images to results/*.npz
 ```
 
