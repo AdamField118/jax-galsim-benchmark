@@ -1,55 +1,16 @@
 #!/bin/bash
-#SBATCH -J jgs_vs_galsim
-#SBATCH --output=logs/benchmark_%j.out
-#SBATCH --error=logs/benchamrk_%j.err
-#SBATCH -p short
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=18
-#SBATCH --time=01:00:00
-#SBATCH --mem=96G
+# Simple local runner: generate a dataset with galsim and jax-galsim and
+# compare them. Assumes the jax-galsim-benchmark environment (see
+# ../environment.yml) is already active.
+set -euo pipefail
 
-# ================================
-# Print job info
-# ================================
-echo "===================================="
-echo "SLURM JOB STARTED"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Node: $(hostname)"
-echo "Start time: $(date)"
-echo "===================================="
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# ================================
-# Avoid thread oversubscription
-# ================================
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-
-# ================================
-# Activate environment
-# ================================
-source /cm/shared/spack/opt/spack/linux-ubuntu20.04-x86_64/gcc-13.2.0/miniconda3-25.1.1-24g7bpuxyyxo5pfd4zn5sldbomvz736a/etc/profile.d/conda.sh
-conda activate jax-galsim-benchmark
-
-# ================================
-# Run code and time execution
-# ================================
 start_time=$(date +%s)
 
-python main.py -c ./config.yaml
+python main.py -c ./config.yaml "$@"
 
 end_time=$(date +%s)
 runtime=$((end_time - start_time))
-
-# Format runtime
-printf -v h "%02d" $((runtime/3600))
-printf -v m "%02d" $(((runtime%3600)/60))
-printf -v s "%02d" $((runtime%60))
-
-echo "===================================="
-echo "Job finished at: $(date)"
-echo "Total runtime: ${h}:${m}:${s} (HH:MM:SS)"
-echo "===================================="
+printf 'Total wall time: %02d:%02d:%02d (HH:MM:SS)\n' \
+    $((runtime/3600)) $(((runtime%3600)/60)) $((runtime%60))

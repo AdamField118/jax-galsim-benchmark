@@ -1,28 +1,36 @@
 simulation:
-  hlr: 0.5
-  flux: 12258.97
-  psf_fwhm: 0.5
-  psf_npix: 53
-  psf_noise: 1.0e-6
-  scale: 0.141
+  hlr: 0.5                  # used when galaxy.hlr_type == constant
+  flux: 12258.97             # used when galaxy.flux_type == constant
+  hlr_type: constant         # constant | catalog
+  flux_type: constant        # constant | catalog
+  scale: 0.141                # pixel scale (arcsec/pixel)
   npix: 53
-  nse_sd: 12.719674
+  noise_sd: 12.719674         # per-pixel noise sigma
   seed: 150
-  n_obs: 1000
-  Njack: 20
-  shear_true: 0.01
+  n_obs: 200                  # number of galaxies to simulate
+  shear_true: 0.01            # applied +/- shear used for the sheared pair
+  ellipticity_sigma: 0.26     # std dev of the synthetic G1/G2 fallback,
+                               # only used if paths.cosmos_cat_fname is missing
+                               # (matches shearnet/core/dataset.py's fallback)
+
+psf:
+  mode: superbit               # superbit = empirical PSFEx models from
+                                # paths.psf_data_dir | ideal = analytic Gaussian
+  fwhm: 0.5                    # used only when mode: ideal
+  npix: 53
+  noise: 1.0e-6
+
+# Both paths are resolved relative to this config file's directory (src/) by
+# main.py, so by default they point at the repo root, i.e. siblings of src/.
+# If either is missing, generation falls back to synthetic ellipticities /
+# an analytic Gaussian PSF and prints a warning.
+paths:
+  cosmos_cat_fname: "../cosmos_catalog_eval.fits"
+  psf_data_dir: "../psf_data/emp_psfs_best/psfex-output"
 
 output:
-  results_fits: "metacal_results.fits"
-  # pdf_name: "sample_galaxies_triplet.pdf"
+  dir: "results"
 
-models:
-  psf_model: "gauss"
-  gal_model: "gauss"
-
-ShearNet:
-  include_sn: False
-  sn_model_name: "second_validation_test_3_params"
-
-catalog:
-  cosmos_cat_fname: "/home/adfield/ShearNet/cosmos15_superbit2023_phot_shapes_with_sigma.csv"
+comparison:
+  jax_warmup: 3               # number of leading jax-galsim calls excluded
+                               # from the steady-state timing (JIT compilation)
