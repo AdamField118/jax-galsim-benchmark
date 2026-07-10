@@ -106,7 +106,14 @@ def render_empirical_psf_stamp(rng, psf_files, wcs, npix_psf, scale):
     psfex = galsim.des.DES_PSFEx(psf_file, wcs=wcs)
     psf_obj = psfex.getPSF(image_pos)
 
-    stamp = psf_obj.drawImage(nx=npix_psf, ny=npix_psf, scale=scale, dtype=np.float64).array
+    # getPSF already returns a GSObject whose profile includes the pixel response
+    # (PSFEx is fit to observed stars). Draw it with method='no_pixel' so the
+    # stamp is a faithful single-pixel sample of that PSF; drawing with the
+    # default 'auto' would convolve by an extra pixel and the downstream
+    # InterpolatedImage would then carry two pixel responses.
+    stamp = psf_obj.drawImage(
+        nx=npix_psf, ny=npix_psf, scale=scale, dtype=np.float64, method="no_pixel"
+    ).array
     return np.ascontiguousarray(stamp)
 
 
@@ -230,14 +237,25 @@ def make_one(mod, t, cfg, psf_mode, dtype=np.float64):
     conv_p = mod.Convolve(psf, objp, gsparams=gsp)
     conv_m = mod.Convolve(psf, objm, gsparams=gsp)
 
+    # The empirical PSFEx model is fit to observed (already-pixelized) stars, so
+    # it -- and the InterpolatedImage of its stamp -- already includes one
+    # convolution by the pixel response. Drawing with the default 'auto' (=fft)
+    # would convolve by the pixel *again*, over-smoothing the result. drawImage's
+    # 'no_pixel' method samples the profile without adding that extra pixel; it is
+    # exactly the case the docstring calls out ("a PSF that already includes a
+    # convolution by the pixel response ... e.g. a PSF from an observed image of a
+    # star"). The analytic Gaussian ('ideal') PSF does NOT include a pixel, so it
+    # keeps 'auto' and lets GalSim add the pixel integration.
+    draw_method = "no_pixel" if psf_mode == "superbit" else "auto"
+
     psf_im = np.array(
-        psf.drawImage(nx=npix_psf, ny=npix_psf, scale=scale, dtype=dtype).array
+        psf.drawImage(nx=npix_psf, ny=npix_psf, scale=scale, dtype=dtype, method=draw_method).array
     ) + t["noise_psf"]
     im_p = np.array(
-        conv_p.drawImage(nx=npix, ny=npix, scale=scale, dtype=dtype).array
+        conv_p.drawImage(nx=npix, ny=npix, scale=scale, dtype=dtype, method=draw_method).array
     ) + t["noise_p"]
     im_m = np.array(
-        conv_m.drawImage(nx=npix, ny=npix, scale=scale, dtype=dtype).array
+        conv_m.drawImage(nx=npix, ny=npix, scale=scale, dtype=dtype, method=draw_method).array
     ) + t["noise_m"]
 
     return psf_im, im_p, im_m
@@ -340,6 +358,10 @@ def _make_batched_render_fn(mod, cfg, psf_mode, fft_size):
     # Pinning min == max makes the k-space FFT grid a compile-time constant, so
     # the batch compiles once instead of retracing on every object's size.
     gsp = mod.GSParams(minimum_fft_size=fft_size, maximum_fft_size=fft_size)
+    # See make_one: the empirical PSF already includes the pixel response, so
+    # draw with 'no_pixel'; the analytic Gaussian keeps the default pixel-adding
+    # 'auto' method.
+    draw_method = "no_pixel" if psf_mode == "superbit" else "auto"
 
     def render_one(psf_stamp, hlr, flux, g1, g2, dx, dy):
         if psf_mode == "superbit":
@@ -349,9 +371,9 @@ def _make_batched_render_fn(mod, cfg, psf_mode, fft_size):
         obj0 = mod.Exponential(half_light_radius=hlr, flux=flux).shear(g1=g1, g2=g2)
         objp = obj0.shear(g1=shear_true, g2=0.0).shift(dx=dx, dy=dy)
         objm = obj0.shear(g1=-shear_true, g2=0.0).shift(dx=dx, dy=dy)
-        psf_im = psf.drawImage(nx=npix_psf, ny=npix_psf, scale=scale).array
-        im_p = mod.Convolve(psf, objp, gsparams=gsp).drawImage(nx=npix, ny=npix, scale=scale).array
-        im_m = mod.Convolve(psf, objm, gsparams=gsp).drawImage(nx=npix, ny=npix, scale=scale).array
+        psf_im = psf.drawImage(nx=npix_psf, ny=npix_psf, scale=scale, method=draw_method).array
+        im_p = mod.Convolve(psf, objp, gsparams=gsp).drawImage(nx=npix, ny=npix, scale=scale, method=draw_method).array
+        im_m = mod.Convolve(psf, objm, gsparams=gsp).drawImage(nx=npix, ny=npix, scale=scale, method=draw_method).array
         return psf_im, im_p, im_m
 
     import jax

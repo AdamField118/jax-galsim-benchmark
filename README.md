@@ -57,6 +57,13 @@ same physical PSF input for both while still exercising each backend's own
 `Convolve`/`shear`/`drawImage` code path. Paths are configured under `paths:`
 in `src/config.yaml`.
 
+Because the PSFEx model is fit to observed (already-pixelized) stars, it
+already includes one convolution by the pixel response. Everything on the
+`superbit` PSF path is therefore drawn with `drawImage(method='no_pixel')`,
+so GalSim/JAX-GalSim does not convolve by the pixel a second time. The
+analytic Gaussian (`ideal`) PSF does not include a pixel and keeps the
+default `method='auto'`.
+
 ## Usage
 
 ```bash
