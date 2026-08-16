@@ -59,4 +59,4 @@ def print_report(report, label_a="galsim", label_b="jax_galsim"):
             f"  {label:<12s} total={t['total_s']:.3f}s  "
             f"{t['mean_ms']:.3f}+/-{t['std_ms']:.3f} ms/obj"
         )
-    print(f"\n  {label_b} is {report['speedup_galsim_over_jax']:.1f}x slower than {label_a} per object")
+    print(f"\n  {label_b} is {report['speedup_jax_over_galsim']:.1f}x faster than {label_a} per object")

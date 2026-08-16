@@ -153,7 +153,7 @@ def main():
 
     from compare import compare_datasets, print_report
 
-    report = compare_datasets(ds_galsim, ds_jax, jax_jit_warmup_s=jax_jit_warmup_s)
+    report = compare_datasets(ds_jax, ds_galsim, jax_jit_warmup_s=jax_jit_warmup_s)
     report_path = os.path.join(outdir, "comparison_report.json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
