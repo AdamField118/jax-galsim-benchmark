@@ -33,7 +33,8 @@ def compare_datasets(ds_galsim, ds_jax, jax_jit_warmup_s=None, label_a="galsim",
         flux_relative_diff_max=float(flux_rel_diff.max()),
         timing={label_a: _timing_stats(ds_galsim), label_b: _timing_stats(ds_jax)},
         jax_jit_warmup_s=jax_jit_warmup_s,
-        speedup_galsim_over_jax=ds_jax.mean_ms / ds_galsim.mean_ms,
+        # >1 means jax-galsim renders an object faster than galsim.
+        speedup_jax_over_galsim=ds_galsim.mean_ms / ds_jax.mean_ms,
     )
 
 
@@ -59,4 +60,8 @@ def print_report(report, label_a="galsim", label_b="jax_galsim"):
             f"  {label:<12s} total={t['total_s']:.3f}s  "
             f"{t['mean_ms']:.3f}+/-{t['std_ms']:.3f} ms/obj"
         )
-    print(f"\n  {label_b} is {report['speedup_jax_over_galsim']:.1f}x faster than {label_a} per object")
+    ratio = report["speedup_jax_over_galsim"]
+    if ratio >= 1.0:
+        print(f"\n  {label_b} is {ratio:.1f}x faster than {label_a} per object")
+    else:
+        print(f"\n  {label_b} is {1.0 / ratio:.1f}x slower than {label_a} per object")

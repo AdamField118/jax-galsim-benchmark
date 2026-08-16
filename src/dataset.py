@@ -18,14 +18,19 @@ i.e. a sibling of `src/`):
     ShearNet's `import_psf`), together with a random position in a
     SuperBIT-sized focal plane.
 
-jax-galsim has no PSFEx/WCS support, so the empirical PSF is always
-evaluated once with galsim and rendered to a pixel stamp; both backends
-then represent that stamp as an InterpolatedImage, which keeps the *same*
-physical PSF input to both while still exercising each backend's own
-Convolve/shear/drawImage code path. If either the catalog or the PSF
-directory is missing, this falls back to synthetic ellipticities /
-an analytic Gaussian PSF -- the same fallback ShearNet itself uses when
-the real data files aren't available (e.g. in CI).
+Both backends are fully independent: each reads the PSFEx model with its own
+reader (``galsim.des.DES_PSFEx`` / ``jax_galsim.des.DES_PSFEx``), builds its
+own TanWCS, evaluates the PSF at the chosen focal-plane position and runs its
+own Convolve/shear/drawImage. Only the *choices* (which catalog row, which
+PSFEx file, which position, the sub-pixel offset and the noise realizations)
+are drawn once with numpy and shared, so the two pipelines can be compared
+pixel-by-pixel on identical inputs. Nothing is rendered by galsim on behalf
+of jax-galsim.
+
+(This requires ``jax_galsim.des``, added in JAX-GalSim PR #261. If either the
+catalog or the PSF directory is missing, generation falls back to synthetic
+ellipticities / an analytic Gaussian PSF -- the same fallback ShearNet itself
+uses when the real data files aren't available.)
 
 All randomness (catalog index, intrinsic ellipticity fallback, PSF
 file/position, sub-pixel offset, noise realizations) is drawn once with
@@ -52,29 +57,52 @@ WCS_PARAMS = {
 MARGIN = 200
 
 
-def _create_wcs_from_params(params):
-    """Port of shearnet.utils.simutils.create_wcs_from_params (galsim-only)."""
-    import galsim
+def _create_wcs_from_params(mod, params):
+    """Port of shearnet.utils.simutils.create_wcs_from_params.
 
+    Parameterized by backend module, so each backend builds its own WCS out of
+    its own classes. jax-galsim implements the whole TanWCS/AffineTransform/
+    CelestialCoord chain, so no galsim objects leak into the jax-galsim path.
+    """
     xsize = params["image_xsize"]
     ysize = params["image_ysize"]
     pixel_scale = params["pixel_scale"]
-    center_ra = params["center_ra"] * galsim.hours
-    center_dec = params["center_dec"] * galsim.degrees
-    theta = params.get("theta", 0.0) * galsim.degrees
+    center_ra = params["center_ra"] * mod.hours
+    center_dec = params["center_dec"] * mod.degrees
+    theta = params.get("theta", 0.0) * mod.degrees
 
-    fiducial_full_image = galsim.ImageF(xsize, ysize)
+    fiducial_full_image = mod.ImageF(xsize, ysize)
 
     dudx = np.cos(theta) * pixel_scale
     dudy = -np.sin(theta) * pixel_scale
     dvdx = np.sin(theta) * pixel_scale
     dvdy = np.cos(theta) * pixel_scale
 
-    affine = galsim.AffineTransform(
+    affine = mod.AffineTransform(
         dudx, dudy, dvdx, dvdy, origin=fiducial_full_image.true_center
     )
-    sky_center = galsim.CelestialCoord(ra=center_ra, dec=center_dec)
-    return galsim.TanWCS(affine, sky_center, units=galsim.arcsec)
+    sky_center = mod.CelestialCoord(ra=center_ra, dec=center_dec)
+    return mod.TanWCS(affine, sky_center, units=mod.arcsec)
+
+
+# DES_PSFEx instances are cached per (backend, file): reading a PSFEx model is
+# host-side FITS I/O that would otherwise be repeated for every object.
+_PSFEX_CACHE = {}
+
+
+def get_psfex(mod, psf_file):
+    """Return a backend-native DES_PSFEx for ``psf_file``, cached.
+
+    Both galsim and jax-galsim (with the ``jax_galsim.des`` module) can read
+    PSFEx files directly, so neither backend needs help from the other.
+    """
+    key = (mod.__name__, psf_file)
+    if key not in _PSFEX_CACHE:
+        if mod.__name__ == "galsim":
+            import galsim.des  # noqa: F401  (populates galsim.des)
+        wcs = _create_wcs_from_params(mod, WCS_PARAMS)
+        _PSFEX_CACHE[key] = mod.des.DES_PSFEx(psf_file, wcs=wcs)
+    return _PSFEX_CACHE[key]
 
 
 def find_psf_files(psf_data_dir):
@@ -88,33 +116,16 @@ def find_psf_files(psf_data_dir):
     return []
 
 
-def render_empirical_psf_stamp(rng, psf_files, wcs, npix_psf, scale):
-    """Evaluate a random empirical PSFEx model at a random focal-plane position.
+def draw_psf_choice(rng, psf_files):
+    """Pick a PSFEx model file and a focal-plane position (mirrors ShearNet's import_psf).
 
-    Only galsim can read PSFEx files (jax-galsim has no `des` module), so
-    this always uses galsim and hands back a plain pixel array that either
-    backend can wrap in an InterpolatedImage.
+    Only the *choice* is made here, with numpy, so both backends evaluate the
+    same model at the same position from their own PSFEx reader.
     """
-    import galsim
-    import galsim.des
-
     x = MARGIN + (WCS_PARAMS["image_xsize"] - 2 * MARGIN) * rng.uniform()
     y = MARGIN + (WCS_PARAMS["image_ysize"] - 2 * MARGIN) * rng.uniform()
-    image_pos = galsim.PositionD(x=x, y=y)
-
     psf_file = psf_files[rng.randint(len(psf_files))]
-    psfex = galsim.des.DES_PSFEx(psf_file, wcs=wcs)
-    psf_obj = psfex.getPSF(image_pos)
-
-    # getPSF already returns a GSObject whose profile includes the pixel response
-    # (PSFEx is fit to observed stars). Draw it with method='no_pixel' so the
-    # stamp is a faithful single-pixel sample of that PSF; drawing with the
-    # default 'auto' would convolve by an extra pixel and the downstream
-    # InterpolatedImage would then carry two pixel responses.
-    stamp = psf_obj.drawImage(
-        nx=npix_psf, ny=npix_psf, scale=scale, dtype=np.float64, method="no_pixel"
-    ).array
-    return np.ascontiguousarray(stamp)
+    return psf_file, x, y
 
 
 def load_cosmos_catalog(cat_path, seed, ellipticity_sigma, hlr, flux, n_synthetic=5000, quiet=False):
@@ -179,7 +190,6 @@ def pregenerate_truth(cfg, paths, quiet=False):
                 f"falling back to an analytic Gaussian PSF (psf.fwhm)."
             )
         psf_mode = "ideal"
-    wcs = _create_wcs_from_params(WCS_PARAMS) if psf_mode == "superbit" else None
 
     truth = []
     for _ in range(n):
@@ -194,9 +204,9 @@ def pregenerate_truth(cfg, paths, quiet=False):
         noise_m = rng.normal(scale=noise_sd, size=(npix, npix))
         noise_psf = rng.normal(scale=psf_noise, size=(npix_psf, npix_psf))
 
-        psf_stamp = None
+        psf_file, psf_x, psf_y = (None, 0.0, 0.0)
         if psf_mode == "superbit":
-            psf_stamp = render_empirical_psf_stamp(rng, psf_files, wcs, npix_psf, scale)
+            psf_file, psf_x, psf_y = draw_psf_choice(rng, psf_files)
 
         truth.append(
             dict(
@@ -209,7 +219,9 @@ def pregenerate_truth(cfg, paths, quiet=False):
                 noise_p=noise_p,
                 noise_m=noise_m,
                 noise_psf=noise_psf,
-                psf_stamp=psf_stamp,
+                psf_file=psf_file,
+                psf_x=psf_x,
+                psf_y=psf_y,
             )
         )
 
@@ -226,7 +238,11 @@ def make_one(mod, t, cfg, psf_mode, dtype=np.float64):
     gsp = mod.GSParams(maximum_fft_size=32768)
 
     if psf_mode == "superbit":
-        psf = mod.InterpolatedImage(mod.Image(t["psf_stamp"], scale=scale))
+        # Each backend reads the PSFEx model itself and evaluates it at the
+        # chosen focal-plane position, so nothing is shared between them but
+        # the choice of file and position.
+        psfex = get_psfex(mod, t["psf_file"])
+        psf = psfex.getPSF(mod.PositionD(t["psf_x"], t["psf_y"]))
     else:
         psf = mod.Gaussian(fwhm=cfg["psf_fwhm"])
 
@@ -238,8 +254,8 @@ def make_one(mod, t, cfg, psf_mode, dtype=np.float64):
     conv_m = mod.Convolve(psf, objm, gsparams=gsp)
 
     # The empirical PSFEx model is fit to observed (already-pixelized) stars, so
-    # it -- and the InterpolatedImage of its stamp -- already includes one
-    # convolution by the pixel response. Drawing with the default 'auto' (=fft)
+    # the profile returned by getPSF already includes one convolution by the
+    # pixel response. Drawing with the default 'auto' (=fft)
     # would convolve by the pixel *again*, over-smoothing the result. drawImage's
     # 'no_pixel' method samples the profile without adding that extra pixel; it is
     # exactly the case the docstring calls out ("a PSF that already includes a
@@ -332,7 +348,52 @@ def generate_dataset(mod, truth_list, cfg, psf_mode, dtype=np.float64):
 # over a batch axis wide enough to fill the SMs. See ANALYSIS.md.
 # ---------------------------------------------------------------------------
 
-def _stack_truth(truth_list, cfg, psf_mode):
+def _psf_stamps(mod, truth_list, cfg, fft_size, chunk=256):
+    """Render each object's PSF stamp with the backend's own PSFEx reader.
+
+    The batched renderer needs fixed-shape PSF inputs, so the empirical PSF is
+    sampled onto a stamp here. For jax-galsim this is done with jit(vmap(...))
+    over a stacked batch of DES_PSFEx models -- possible because the PSFEx data
+    is traced (JAX-GalSim PR #261), so models from *different* files share a
+    tree structure. Doing it object-by-object in eager JAX instead costs ~460
+    ms/object (~75 minutes for 10,000) versus ~2 ms/object batched.
+    """
+    npix_psf, scale = cfg["psf_npix"], cfg["scale"]
+
+    def eager_stamp(t):
+        return np.asarray(
+            get_psfex(mod, t["psf_file"])
+            .getPSF(mod.PositionD(t["psf_x"], t["psf_y"]))
+            .drawImage(nx=npix_psf, ny=npix_psf, scale=scale, method="no_pixel")
+            .array
+        )
+
+    if mod.__name__ != "jax_galsim":
+        return np.stack([eager_stamp(t) for t in truth_list])
+
+    import jax
+    import jax.numpy as jnp
+
+    gsp = mod.GSParams(minimum_fft_size=fft_size, maximum_fft_size=fft_size)
+
+    def one(model, x, y):
+        return model.getPSF(mod.PositionD(x, y), gsparams=gsp).drawImage(
+            nx=npix_psf, ny=npix_psf, scale=scale, method="no_pixel"
+        ).array
+
+    render = jax.jit(jax.vmap(one))
+    out = np.empty((len(truth_list), npix_psf, npix_psf))
+    for start in range(0, len(truth_list), chunk):
+        sub = truth_list[start : start + chunk]
+        models = [get_psfex(mod, t["psf_file"]) for t in sub]
+        batch = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *models)
+        xs = jnp.array([t["psf_x"] for t in sub])
+        ys = jnp.array([t["psf_y"] for t in sub])
+        out[start : start + len(sub)] = np.asarray(render(batch, xs, ys))
+    return out
+
+
+def _stack_truth(mod, truth_list, cfg, psf_mode, fft_size):
     """Stack the per-object truth dicts into contiguous arrays for vmap."""
     n = len(truth_list)
     hlr = np.array([t["hlr"] for t in truth_list])
@@ -342,7 +403,7 @@ def _stack_truth(truth_list, cfg, psf_mode):
     dx = np.array([t["dx"] for t in truth_list])
     dy = np.array([t["dy"] for t in truth_list])
     if psf_mode == "superbit":
-        psf_stamps = np.stack([t["psf_stamp"] for t in truth_list])
+        psf_stamps = _psf_stamps(mod, truth_list, cfg, fft_size)
     else:
         psf_stamps = np.zeros((n, cfg["psf_npix"], cfg["psf_npix"]))
     return dict(hlr=hlr, flux=flux, g1=g1, g2=g2, dx=dx, dy=dy, psf_stamps=psf_stamps)
@@ -392,7 +453,7 @@ def generate_dataset_batched(mod, truth_list, cfg, psf_mode, batch_size, fft_siz
     import jax.numpy as jnp
 
     n = len(truth_list)
-    stacked = _stack_truth(truth_list, cfg, psf_mode)
+    stacked = _stack_truth(mod, truth_list, cfg, psf_mode, fft_size)
     render = _make_batched_render_fn(mod, cfg, psf_mode, fft_size)
 
     psf_ims = np.empty((n, cfg["psf_npix"], cfg["psf_npix"]))

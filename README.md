@@ -50,12 +50,18 @@ real data, place these at the repo root (siblings of `src/`):
 - `psf_data/emp_psfs_best/psfex-output/` -- a directory of `.psf` PSFEx
   model files (e.g. copied from ShearNet's `psf_data/`).
 
-jax-galsim has no PSFEx/WCS support, so the empirical PSF for each object is
-always evaluated once with galsim and rendered to a pixel stamp; both
-backends then represent that stamp as an `InterpolatedImage`, keeping the
-same physical PSF input for both while still exercising each backend's own
-`Convolve`/`shear`/`drawImage` code path. Paths are configured under `paths:`
-in `src/config.yaml`.
+**Both backends are fully independent.** Each reads the PSFEx model with its
+own reader (`galsim.des.DES_PSFEx` / `jax_galsim.des.DES_PSFEx`), builds its
+own `TanWCS`, evaluates the PSF at the chosen focal-plane position, and runs
+its own `Convolve`/`shear`/`drawImage`. Only the *choices* are shared — which
+catalog row, which PSFEx file, which position, the sub-pixel offset and the
+noise realizations — all drawn once with numpy so the two pipelines can be
+compared pixel-by-pixel on identical inputs. Nothing is rendered by galsim on
+behalf of jax-galsim. Paths are configured under `paths:` in `src/config.yaml`.
+
+> This requires `jax_galsim.des`, added in
+> [JAX-GalSim PR #261](https://github.com/GalSim-developers/JAX-GalSim/pull/261).
+> Until that merges, install jax-galsim from that branch.
 
 Because the PSFEx model is fit to observed (already-pixelized) stars, it
 already includes one convolution by the pixel response. Everything on the
@@ -63,6 +69,47 @@ already includes one convolution by the pixel response. Everything on the
 so GalSim/JAX-GalSim does not convolve by the pixel a second time. The
 analytic Gaussian (`ideal`) PSF does not include a pixel and keeps the
 default `method='auto'`.
+
+## Fidelity: how closely do the two agree?
+
+`src/analyze_agreement.py` renders noiseless stamps with both backends and
+scores them against **JAX-GalSim's own image-comparison cutoffs** (from
+`tests/jax/test_spergel_comp_galsim.py`): `rtol=0` with `atol=1e-9` when the
+two renderings may differ in FFT grid, and `atol=1e-16` for analytic profiles
+on an identical grid. Those are defined on a *unit-flux* image, so the script
+compares `max|Δ|/flux`.
+
+```bash
+cd src
+python analyze_agreement.py -c config.yaml --n-obs 50
+```
+
+Over 40 objects spanning 40 distinct PSFEx models:
+
+| quantity | result | cutoff |
+|---|---|---|
+| PSF stamp, `max\|Δ\|/flux` | 2.5e-15 | 1e-9 ✅ |
+| galaxy stamp, `max\|Δ\|/flux` | 1.4e-11 | 1e-9 ✅ |
+| relative flux error | 3.2e-09 | — |
+| HSM `\|Δe1\|`, `\|Δe2\|` | **0 exactly** | — |
+| HSM `\|Δsigma\|` | 2.4e-07 pix (max) | — |
+
+Both backends pick identical `stepk`/`maxk`, so they use the same FFT grid.
+The galaxy residual sits above the 1e-16 analytic ideal because this pipeline
+interpolates an empirically-sampled PSF (Lanczos) and applies a WCS transform
+— extra float operations XLA may reorder relative to C++ — but it is ~70x
+inside the 1e-9 tolerance. The headline is the last two rows: adaptive-moment
+ellipticities come out **bit-identical**, so shear estimates are unaffected.
+
+### Caveat on the batched path
+
+The pixel differences printed by `main.py --jax-mode batched` are *not* a
+backend comparison: `vmap` needs fixed-shape inputs, so the batched path
+resamples the PSF onto a stamp and wraps it in an `InterpolatedImage`, while
+the galsim reference convolves the native PSFEx profile. Doing both *within
+galsim* attributes the gap to the stamp round-trip (~5e-1) rather than the
+pinned FFT size (~2e-5). Use `analyze_agreement.py` for fidelity, and the
+batched mode for throughput.
 
 ## Usage
 
@@ -96,3 +143,5 @@ default.
 - `src/main.py` -- CLI entry point tying the above together.
 - `src/diagnose_jax.py` -- standalone script that measures op counts, compile
   counts, and eager-vs-batched timing to explain the performance gap.
+- `src/analyze_agreement.py` -- stamp-level fidelity analysis scored against
+  JAX-GalSim's own accuracy cutoffs, including HSM shape agreement.

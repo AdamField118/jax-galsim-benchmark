@@ -153,12 +153,24 @@ def main():
 
     from compare import compare_datasets, print_report
 
-    report = compare_datasets(ds_jax, ds_galsim, jax_jit_warmup_s=jax_jit_warmup_s)
+    report = compare_datasets(ds_galsim, ds_jax, jax_jit_warmup_s=jax_jit_warmup_s)
     report_path = os.path.join(outdir, "comparison_report.json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
 
     print_report(report)
+
+    if jax_mode in ("batched", "both"):
+        print(
+            "\n  NOTE: in batched mode the pixel differences above are dominated by\n"
+            "  the batched path's own approximation, not by any backend disagreement.\n"
+            "  vmap needs fixed-shape inputs, so the empirical PSF is resampled onto a\n"
+            "  stamp and wrapped in an InterpolatedImage, while the galsim reference\n"
+            "  convolves the native PSFEx profile. Rendering both ways *within galsim*\n"
+            "  gives ~5e-1 from the stamp round-trip vs ~2e-5 from the pinned FFT size.\n"
+            "  For a like-for-like fidelity comparison use the exact (eager) path:\n"
+            "      python analyze_agreement.py -c config.yaml --n-obs 50"
+        )
     print(f"\nSaved comparison report to {report_path}")
 
     if not args.no_plots:
